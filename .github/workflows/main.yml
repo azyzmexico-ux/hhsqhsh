@@ -6,14 +6,10 @@ jobs:
     runs-on: windows-latest
     steps:
 
-    - name: Enable RDP + Disable NLA
+    - name: Enable RDP
       run: |
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0 -Force
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name SecurityLayer -Value 0 -Force
-
         netsh advfirewall firewall add rule name="AllowRDP" dir=in action=allow protocol=TCP localport=3389
-        
         Restart-Service TermService -Force
 
     - name: Create RDP User
@@ -23,35 +19,65 @@ jobs:
         New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires
         Add-LocalGroupMember -Group "Administrators" -Member "RDP"
         Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-
-        echo "RDP_USER=RDP" >> $env:GITHUB_ENV
         echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
     - name: Download Ngrok
       run: |
         Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
-        Expand-Archive ngrok.zip -DestinationPath .
+        Expand-Archive ngrok.zip -DestinationPath ngrok
 
-    - name: Start Ngrok Tunnel (TCP 3389)
+    - name: Start Ngrok
       run: |
-        .\ngrok.exe authtoken ${{ secrets.NGROK_AUTH }}
-        Start-Process -FilePath ".\ngrok.exe" -ArgumentList "tcp 3389" -NoNewWindow
+        ./ngrok/ngrok.exe authtoken ${{ secrets.NGROK_AUTH }}
+        Start-Process -FilePath "./ngrok/ngrok.exe" -ArgumentList "tcp 3389 --region=eu" -NoNewWindow
+        Start-Sleep -Seconds 10
 
-    - name: Display Connection Info
+    - name: Wait for Ngrok Tunnel
       shell: pwsh
       run: |
-        Start-Sleep -Seconds 5
-        $tunnel = (Invoke-WebRequest -Uri "http://127.0.0.1:4040/api/tunnels").Content | ConvertFrom-Json
-        $addr = $tunnel.tunnels.public_url
-        Write-Host "============================"
-        Write-Host "     RDP CONNECTION INFO    "
-        Write-Host "============================"
-        Write-Host "Ngrok TCP: $addr"
-        Write-Host "Username: $env:RDP_USER"
-        Write-Host "Password: $env:RDP_PASS"
-        Write-Host "============================"
+        $maxRetries = 20
+        $retry = 0
+        $tunnel = $null
 
-    - name: Keep Session Alive
+        while (-not $tunnel -and $retry -lt $maxRetries) {
+          try {
+            $response = Invoke-WebRequest -Uri "http://127.0.0.1:4040/api/tunnels" -UseBasicParsing -TimeoutSec 2
+            $json = $response.Content | ConvertFrom-Json
+            if ($json.tunnels.Count -gt 0) {
+              $tunnel = $json.tunnels[0].public_url
+              break
+            }
+          }
+          catch {
+            # ignore errors
+          }
+
+          Write-Host "Ngrok not ready yet... retrying ($retry/$maxRetries)"
+          Start-Sleep -Seconds 2
+          $retry++
+        }
+
+        if (-not $tunnel) {
+          Write-Error "Ngrok tunnel failed to start."
+          exit 1
+        }
+
+        Write-Host "NGROK_TUNNEL=$tunnel"
+        echo "NGROK_TUNNEL=$tunnel" >> $env:GITHUB_ENV
+
+    - name: Show RDP Info
+      run: |
+        Write-Host "===================================="
+        Write-Host "      RDP CONNECTION DETAILS        "
+        Write-Host "===================================="
+        Write-Host "Connect to:"
+        Write-Host "$env:NGROK_TUNNEL"
+        Write-Host ""
+        Write-Host "User: RDP"
+        Write-Host "Pass: $env:RDP_PASS"
+        Write-Host "===================================="
+
+    - name: Keep Alive
       run: |
         while ($true) {
           Write-Host "RDP Active..."
